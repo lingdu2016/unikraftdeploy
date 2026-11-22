@@ -1,0 +1,50 @@
+# =====================================================================
+# Uptime Kuma 项目配置
+# 文件名（不含 .yaml）必须与 deploy.yml 里 project 选项的值一致。
+# 部署别的项目：复制本文件（或 _template.yaml），按下面标 ▶ 的位置修改。
+# =====================================================================
+
+# ▶ 实例名前缀。最终实例名 = <name>-<地区>，如 uptime-kuma-sin。
+#   同时也是镜像名：<你的组织>/<name>:latest（须为小写字母/数字/-）
+name: uptime-kuma
+
+build:
+  # ▶ 基础镜像：换项目时改成目标镜像，如 louislam/uptime-kuma:2、nginx:1.27
+  base_image: louislam/uptime-kuma:2
+
+  # ▶（可选）启动命令。默认沿用镜像自带命令；若实例起不来，看日志后在此显式指定
+  # cmd: ["node", "server/server.js"]
+
+  # ▶（可选）完整 Dockerfile。写了它会忽略上面的 base_image。
+  #   适合需要下载二进制、安装依赖的项目（如 Alist）。不支持 COPY 仓库里的本地文件。
+  # dockerfile: |
+  #   FROM debian:bookworm-slim
+  #   RUN apt-get update && apt-get install -y ca-certificates wget
+  #   ...
+
+  # （可选）运行时，一般不用改
+  # runtime: base-compat:latest
+
+# ▶ 内存 / CPU：按项目实际占用调整，如 256M、1G、4G
+memory: 512M
+vcpus: 1
+
+# ▶ 对外端口，格式 外部端口:程序实际监听的端口/协议
+#   换项目时必须把 3001 改成该程序实际监听的端口。
+ports:
+  - 443:3001/http+tls
+
+# ▶ 环境变量，每行一个 KEY=VALUE。注意：这里的内容会出现在 Actions 日志里，别写密码。
+env:
+  - UPTIME_KUMA_PORT=3001
+
+# ▶ 持久化目录。path 必须是该程序存放数据的目录（Uptime Kuma 为 /app/data）。
+#   卷按地区独立；删除实例不会删除卷。不需要持久化就整段删掉。
+volumes:
+  - name: uptime-kuma-data
+    path: /app/data
+    size: 1G
+
+# ▶ 休眠策略。留空 = 不休眠（常驻）；监控类服务必须留空。
+#   需要按需休眠时再写，如：policy=idle,cooldown-time=1000,stateful=true
+scale_to_zero: ""

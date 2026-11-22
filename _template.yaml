@@ -1,0 +1,29 @@
+# =====================================================================
+# 新项目模板：复制为 <项目名>.yaml，然后在 deploy.yml 的 project 选项里追加 <项目名>
+# 凡是标 ▶ 的都是每个项目需要确认/修改的地方。
+# =====================================================================
+
+name: myapp                    # ▶ 实例名前缀 + 镜像名（小写字母/数字/-）
+
+build:
+  base_image: owner/image:tag  # ▶ 目标镜像（与 dockerfile 二选一）
+  # cmd: ["/path/to/bin", "--arg"]   # ▶ 可选：启动命令
+  # dockerfile: |                    # ▶ 可选：完整 Dockerfile
+  #   FROM debian:bookworm-slim
+  #   ...
+
+memory: 512M                   # ▶ 按需调整
+vcpus: 1
+
+ports:
+  - 443:8080/http+tls          # ▶ 8080 改成程序实际监听端口
+
+env:                           # ▶ 可选，勿放密码
+  - KEY=VALUE
+
+volumes:                       # ▶ 可选：需要持久化时填写
+  - name: myapp-data
+    path: /data                # ▶ 程序存放数据的目录
+    size: 1G
+
+scale_to_zero: ""              # ▶ 留空=常驻；否则如 policy=idle,cooldown-time=1000,stateful=true
