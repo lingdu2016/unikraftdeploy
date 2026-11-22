@@ -1,6 +1,8 @@
 # =====================================================================
 # 统一部署工作流：「(按需)构建 → 推送到你的组织 → 运行 → 校验实例确实 running」
 #
+# 部署后会校验实例进入 running；若因 "image pull failed" 被平台停止，自动重启最多 3 次。
+#
 # 构建策略：
 #   - 你的组织里已有同名镜像（<组织>/<name>）时，默认跳过构建，直接运行
 #   - 需要重新构建时（修改了 base_image / dockerfile / cmd，或旧镜像有问题），
@@ -232,29 +234,53 @@ jobs:
             exit 1
           fi
 
-          # ---------- 7. 校验实例确实进入运行状态 ----------
-          # 轮询 `unikraft instances get` 输出中的 state 行：
+          # ---------- 7. 校验实例确实进入运行状态（镜像拉取失败时自动重试启动）----------
+          # 背景：刚构建并推送的镜像，平台首次启动时可能报 "image pull failed"（实例被平台停止）；
+          #       同一镜像稍后再次启动往往可以成功。所以遇到这种情况会重新启动实例，最多 3 次。
+          # 判定：轮询 `unikraft instances get` 输出中的 state 行
           #   running / standby（已按策略缩容到零）→ 成功
-          #   连续两次 stopped → 失败（平台已停止实例，如镜像拉取失败）
-          #   最长等待约 200 秒
-          echo "Waiting for instance ${INSTANCE} to be running..."
-          STATE=""
-          STOPPED_COUNT=0
+          #   连续 3 次 stopped → 本轮失败
+          #   每轮最长等待约 200 秒
+          # 只有失败原因是 "image pull failed" 才会重试；应用自身崩溃等其他原因直接失败。
+          wait_for_running() {
+            local t stopped=0
+            STATE=""
+            for ((t = 1; t <= 40; t++)); do
+              STATE="$(unikraft instances get "$INSTANCE" 2>/dev/null | awk '/^state:/{print $2; exit}')" || true
+              echo "[${t}/40] state=${STATE:-unknown}"
+              case "$STATE" in
+                running|standby) return 0 ;;
+                stopped)         stopped=$((stopped + 1)) ;;
+                *)               stopped=0 ;;
+              esac
+              if (( stopped >= 3 )); then return 1; fi
+              sleep 5
+            done
+            return 1
+          }
+
+          MAX_PULL_RETRIES=3
+          ATTEMPT=0
           OK=false
-          for ((t = 1; t <= 40; t++)); do
-            STATE="$(unikraft instances get "$INSTANCE" 2>/dev/null | awk '/^state:/{print $2; exit}')" || true
-            echo "[${t}/40] state=${STATE:-unknown}"
-            case "$STATE" in
-              running|standby) OK=true; break ;;
-              stopped)         STOPPED_COUNT=$((STOPPED_COUNT + 1)) ;;
-              *)               STOPPED_COUNT=0 ;;
-            esac
-            if (( STOPPED_COUNT >= 2 )); then break; fi
-            sleep 5
+          echo "Waiting for instance ${INSTANCE} to be running..."
+          while true; do
+            if wait_for_running; then OK=true; break; fi
+
+            DETAIL="$(unikraft instances get "$INSTANCE" 2>&1 || true)"
+            if [[ "$STATE" == "stopped" ]] && grep -qi "image pull failed" <<<"$DETAIL" \
+                && (( ATTEMPT < MAX_PULL_RETRIES )); then
+              ATTEMPT=$((ATTEMPT + 1))
+              echo "Image pull failed; starting the instance again in 20s (retry ${ATTEMPT}/${MAX_PULL_RETRIES})..."
+              sleep 20
+              unikraft instances start "$INSTANCE" || echo "instances start returned an error, will re-check state." >&2
+              sleep 5
+              continue
+            fi
+            break
           done
 
           if [[ "$OK" != "true" ]]; then
-            echo "Instance ${INSTANCE} did not reach running state (last state: ${STATE:-unknown})." >&2
+            echo "Instance ${INSTANCE} did not reach running state (last state: ${STATE:-unknown}, pull retries: ${ATTEMPT})." >&2
             echo "---- instance details ----"
             unikraft instances get "$INSTANCE" || true
             echo "---- instance logs ----"
@@ -262,7 +288,7 @@ jobs:
             {
               echo "### 部署失败"
               echo ""
-              echo "- **实例**: \`${INSTANCE}\`，最后状态 \`${STATE:-unknown}\`"
+              echo "- **实例**: \`${INSTANCE}\`，最后状态 \`${STATE:-unknown}\`，镜像拉取重试 ${ATTEMPT} 次"
               echo "- 详情与日志见上方步骤输出；重新部署前请先用 delete 工作流删除该实例"
               if [[ "$NEED_BUILD" == "false" ]]; then
                 echo "- 本次**跳过了构建**（复用已有镜像）。若怀疑旧镜像有问题，请勾选 rebuild 重新运行"
