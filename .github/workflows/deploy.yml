@@ -1,5 +1,10 @@
 # =====================================================================
-# 统一部署工作流：每次都「构建 → 推送到你的组织 → 运行」
+# 统一部署工作流：「(按需)构建 → 推送到你的组织 → 运行 → 校验实例确实 running」
+#
+# 构建策略：
+#   - 你的组织里已有同名镜像（<组织>/<name>）时，默认跳过构建，直接运行
+#   - 需要重新构建时（修改了 base_image / dockerfile / cmd，或旧镜像有问题），
+#     运行时勾选 rebuild
 #
 # 部署其他项目时，本文件只需要改一处：
 #   ▶ inputs.project.options 里追加一行  - <项目名>
@@ -32,6 +37,11 @@ on:
           - sfo - 旧金山 (San Francisco, US)
           - sin - 新加坡 (Singapore)
           - was - 华盛顿 (Washington DC, US)
+      rebuild:
+        description: 强制重新构建镜像（默认：组织里已有同名镜像则跳过构建）
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   deploy:
@@ -69,12 +79,13 @@ jobs:
           UNIKRAFT_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
         run: echo "$UNIKRAFT_TOKEN" | unikraft login --token -
 
-      # ---- 核心步骤：读取 yaml → 构建 → 运行 ----
-      - name: Build and deploy instance
+      # ---- 核心步骤：读取 yaml →（按需）构建 → 运行 → 校验 ----
+      - name: Build (if needed) and deploy instance
         id: deploy
         env:
           PROJECT: ${{ inputs.project }}
           METRO: ${{ inputs.metro }}
+          REBUILD: ${{ inputs.rebuild }}
         run: |
           set -euo pipefail
 
@@ -104,8 +115,8 @@ jobs:
             exit 1
           fi
 
-          # ---------- 2. 解析你的 Unikraft 组织名（与原 get-org-name.sh 逻辑一致）----------
-          # 构建出的镜像会推送到 <组织名>/<项目名>:latest
+          # ---------- 2. 解析你的 Unikraft 组织标识（与原 get-org-name.sh 逻辑一致）----------
+          # 镜像引用 = <组织标识>/<项目名>:latest
           CONFIG="${UNIKRAFT_CONFIG:-$HOME/.config/unikraft/config.yaml}"
           if [[ ! -f "$CONFIG" ]]; then
             echo "Unikraft config not found: $CONFIG" >&2
@@ -119,34 +130,51 @@ jobs:
           fi
           echo "Using organization: ${ORG}"
 
-          IMAGE="${ORG}/${NAME}:latest"      # 注意：name 须是合法镜像名（小写字母/数字/-）
+          IMAGE_REF="${ORG}/${NAME}"         # 注意：name 须是合法镜像名（小写字母/数字/-）
+          IMAGE="${IMAGE_REF}:latest"
 
-          # ---------- 3. 生成构建目录：Dockerfile + Kraftfile ----------
-          CTX="$(mktemp -d)"
-
-          if [[ -n "$DOCKERFILE" ]]; then
-            # 写了 build.dockerfile：原样使用（适合需要下载二进制、装依赖的项目）
-            printf '%s\n' "$DOCKERFILE" > "$CTX/Dockerfile"
+          # ---------- 3. 判断是否需要构建 ----------
+          # `unikraft images list` 列出组织在中央仓库里的镜像（REF / DIGEST 两列），
+          # 第一列与 <组织>/<name>（或带 :latest）完全一致即视为已存在。
+          NEED_BUILD=true
+          if [[ "$REBUILD" == "true" ]]; then
+            echo "rebuild requested: will build ${IMAGE}"
+          elif unikraft images list 2>/dev/null \
+              | awk -v a="$IMAGE_REF" -v b="$IMAGE" '$1==a || $1==b {found=1} END{exit !found}'; then
+            NEED_BUILD=false
+            echo "Image ${IMAGE_REF} already exists in your organization, skip build."
           else
-            # 只写了 build.base_image：生成一行 FROM（适合直接包装现成镜像）
-            printf 'FROM %s\n' "$BASE_IMAGE" > "$CTX/Dockerfile"
+            echo "Image ${IMAGE_REF} not found, will build."
           fi
 
-          {
-            echo "spec: v0.7"
-            echo "runtime: ${RUNTIME}"
-            echo "rootfs: ./Dockerfile"
-            # build.cmd 不为空时，写入 Kraftfile 的 cmd（覆盖启动命令）
-            if [[ "$(yq '(.build.cmd // []) | length' "$CFG")" -gt 0 ]]; then
-              yq '{"cmd": .build.cmd}' "$CFG"
+          # ---------- 4. 构建并推送（仅在需要时）----------
+          if [[ "$NEED_BUILD" == "true" ]]; then
+            CTX="$(mktemp -d)"
+
+            if [[ -n "$DOCKERFILE" ]]; then
+              # 写了 build.dockerfile：原样使用（适合需要下载二进制、装依赖的项目）
+              printf '%s\n' "$DOCKERFILE" > "$CTX/Dockerfile"
+            else
+              # 只写了 build.base_image：生成一行 FROM（适合直接包装现成镜像）
+              printf 'FROM %s\n' "$BASE_IMAGE" > "$CTX/Dockerfile"
             fi
-          } > "$CTX/Kraftfile"
 
-          echo "---- Dockerfile ----"; cat "$CTX/Dockerfile"
-          echo "---- Kraftfile ----";  cat "$CTX/Kraftfile"
+            {
+              echo "spec: v0.7"
+              echo "runtime: ${RUNTIME}"
+              echo "rootfs: ./Dockerfile"
+              # build.cmd 不为空时，写入 Kraftfile 的 cmd（覆盖启动命令）
+              if [[ "$(yq '(.build.cmd // []) | length' "$CFG")" -gt 0 ]]; then
+                yq '{"cmd": .build.cmd}' "$CFG"
+              fi
+            } > "$CTX/Kraftfile"
 
-          # ---------- 4. 构建并推送（每次部署都会重新构建）----------
-          unikraft build "$CTX" --output "$IMAGE"
+            echo "---- Dockerfile ----"; cat "$CTX/Dockerfile"
+            echo "---- Kraftfile ----";  cat "$CTX/Kraftfile"
+
+            # --output 为 <组织>/<name>:latest（不以 ./ ../ / 开头）= 推送到中央仓库
+            unikraft build "$CTX" --output "$IMAGE"
+          fi
 
           # ---------- 5. 组装 unikraft run 命令 ----------
           # 实例名固定为 <name>-<metro>；同名实例已存在时会失败（需先用 delete 工作流删除）
@@ -191,6 +219,8 @@ jobs:
           done
 
           # ---------- 6. 运行，并提取 FQDN（与原项目一致）----------
+          # 注意：CLI 创建实例后只等待约 10 秒，等不到 running 也会正常返回，
+          # 所以下面第 7 步必须自己确认最终状态。
           echo "Running: ${CMD[*]}"
           RUN_JSON="$("${CMD[@]}")"
           echo "$RUN_JSON" > run-output.json
@@ -202,11 +232,51 @@ jobs:
             exit 1
           fi
 
+          # ---------- 7. 校验实例确实进入运行状态 ----------
+          # 轮询 `unikraft instances get` 输出中的 state 行：
+          #   running / standby（已按策略缩容到零）→ 成功
+          #   连续两次 stopped → 失败（平台已停止实例，如镜像拉取失败）
+          #   最长等待约 200 秒
+          echo "Waiting for instance ${INSTANCE} to be running..."
+          STATE=""
+          STOPPED_COUNT=0
+          OK=false
+          for ((t = 1; t <= 40; t++)); do
+            STATE="$(unikraft instances get "$INSTANCE" 2>/dev/null | awk '/^state:/{print $2; exit}')" || true
+            echo "[${t}/40] state=${STATE:-unknown}"
+            case "$STATE" in
+              running|standby) OK=true; break ;;
+              stopped)         STOPPED_COUNT=$((STOPPED_COUNT + 1)) ;;
+              *)               STOPPED_COUNT=0 ;;
+            esac
+            if (( STOPPED_COUNT >= 2 )); then break; fi
+            sleep 5
+          done
+
+          if [[ "$OK" != "true" ]]; then
+            echo "Instance ${INSTANCE} did not reach running state (last state: ${STATE:-unknown})." >&2
+            echo "---- instance details ----"
+            unikraft instances get "$INSTANCE" || true
+            echo "---- instance logs ----"
+            unikraft instances logs "$INSTANCE" || true
+            {
+              echo "### 部署失败"
+              echo ""
+              echo "- **实例**: \`${INSTANCE}\`，最后状态 \`${STATE:-unknown}\`"
+              echo "- 详情与日志见上方步骤输出；重新部署前请先用 delete 工作流删除该实例"
+              if [[ "$NEED_BUILD" == "false" ]]; then
+                echo "- 本次**跳过了构建**（复用已有镜像）。若怀疑旧镜像有问题，请勾选 rebuild 重新运行"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
           {
             echo "fqdn=${FQDN}"
             echo "metro=${METRO_CODE}"
             echo "instance=${INSTANCE}"
             echo "image=${IMAGE}"
+            echo "built=${NEED_BUILD}"
           } >> "$GITHUB_OUTPUT"
           echo "Deployed at: https://${FQDN}"
 
@@ -218,13 +288,16 @@ jobs:
           METRO_CODE: ${{ steps.deploy.outputs.metro }}
           INSTANCE: ${{ steps.deploy.outputs.instance }}
           IMAGE: ${{ steps.deploy.outputs.image }}
+          BUILT: ${{ steps.deploy.outputs.built }}
         run: |
+          BUILD_NOTE="已构建并推送"
+          if [[ "$BUILT" == "false" ]]; then BUILD_NOTE="已跳过构建（复用组织中已有镜像）"; fi
           {
             echo "### 部署完成"
             echo ""
             echo "- **项目**: \`${PROJECT}\`"
             echo "- **地区**: \`${METRO_CODE}\`"
             echo "- **实例名**: \`${INSTANCE}\`（删除时使用）"
-            echo "- **镜像**: \`${IMAGE}\`"
+            echo "- **镜像**: \`${IMAGE}\`（${BUILD_NOTE}）"
             echo "- **访问地址**: https://${FQDN}"
           } >> "$GITHUB_STEP_SUMMARY"
