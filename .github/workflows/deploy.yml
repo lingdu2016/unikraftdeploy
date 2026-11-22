@@ -1,1 +1,230 @@
+# =====================================================================
+# 统一部署工作流：每次都「构建 → 推送到你的组织 → 运行」
+#
+# 部署其他项目时，本文件只需要改一处：
+#   ▶ inputs.project.options 里追加一行  - <项目名>
+#     （项目名 = 根目录 <项目名>.yaml 的文件名，不含 .yaml）
+# 其余逻辑全部由各项目的 yaml 配置驱动，不需要再改这个文件。
+# =====================================================================
+name: Deploy Unikraft Instance
 
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 项目（对应根目录的 <project>.yaml）
+        required: true
+        type: choice
+        default: uptime-kuma
+        options:
+          - uptime-kuma
+          # ▶ 新增项目时在这里追加，例如：
+          # - alist
+          # - nginx-proxy-manager
+      metro:
+        description: 部署地区
+        required: true
+        type: choice
+        default: sin - 新加坡 (Singapore)
+        options:
+          - dal - 达拉斯 (Dallas, US)
+          - fra - 法兰克福 (Frankfurt, DE)
+          - sfo - 旧金山 (San Francisco, US)
+          - sin - 新加坡 (Singapore)
+          - was - 华盛顿 (Washington DC, US)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 安装官方 CLI（与原项目一致，不要改）----
+      - name: Install Unikraft CLI
+        run: |
+          set -euo pipefail
+
+          # Prefer official apt repo (avoids flaky GitHub release CDN).
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            -o /etc/apt/keyrings/unikraft-cli.gpg \
+            https://pkg.unikraft.com/debian/cli-apt/keys/cli-apt.gpg
+          sudo tee /etc/apt/sources.list.d/unikraft-cli.sources >/dev/null <<EOF
+          Types: deb
+          URIs: https://pkg.unikraft.com/debian/cli-apt/
+          Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+          Components: stable
+          Signed-By: /etc/apt/keyrings/unikraft-cli.gpg
+          EOF
+          sudo apt-get update
+          sudo apt-get install -y unikraft-cli
+          unikraft version
+
+      # ---- 登录（Token 存放在仓库 Secrets：UNIKRAFT_TOKEN，不要改）----
+      - name: Login to Unikraft Cloud
+        env:
+          UNIKRAFT_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: echo "$UNIKRAFT_TOKEN" | unikraft login --token -
+
+      # ---- 核心步骤：读取 yaml → 构建 → 运行 ----
+      - name: Build and deploy instance
+        id: deploy
+        env:
+          PROJECT: ${{ inputs.project }}
+          METRO: ${{ inputs.metro }}
+        run: |
+          set -euo pipefail
+
+          # 地区截取：选项 "sin - 新加坡 (Singapore)" → "sin"（与原项目一致）
+          METRO_CODE="${METRO%% *}"
+
+          # 项目配置文件：<project>.yaml
+          CFG="${PROJECT}.yaml"
+          if [[ ! -f "$CFG" ]]; then
+            echo "Config file not found: $CFG" >&2
+            exit 1
+          fi
+
+          # ---------- 1. 读取 yaml 配置（yq 在 ubuntu-latest 上已预装）----------
+          # 以下 yq 表达式里 `// ""` 表示"字段缺失时用空字符串"
+          NAME="$(yq '.name // ""' "$CFG")"
+          NAME="${NAME:-$PROJECT}"                                   # 未写 name 时取文件名
+          BASE_IMAGE="$(yq '.build.base_image // ""' "$CFG")"        # 基础镜像（FROM 用）
+          DOCKERFILE="$(yq '.build.dockerfile // ""' "$CFG")"        # 自定义完整 Dockerfile（可选）
+          RUNTIME="$(yq '.build.runtime // "base-compat:latest"' "$CFG")"
+          MEMORY="$(yq '.memory // "512M"' "$CFG")"
+          VCPUS="$(yq '.vcpus // ""' "$CFG")"
+          SCALE_TO_ZERO="$(yq '.scale_to_zero // ""' "$CFG")"        # 空 = 不休眠
+
+          if [[ -z "$BASE_IMAGE" && -z "$DOCKERFILE" ]]; then
+            echo "$CFG needs build.base_image or build.dockerfile." >&2
+            exit 1
+          fi
+
+          # ---------- 2. 解析你的 Unikraft 组织名（与原 get-org-name.sh 逻辑一致）----------
+          # 构建出的镜像会推送到 <组织名>/<项目名>:latest
+          CONFIG="${UNIKRAFT_CONFIG:-$HOME/.config/unikraft/config.yaml}"
+          if [[ ! -f "$CONFIG" ]]; then
+            echo "Unikraft config not found: $CONFIG" >&2
+            exit 1
+          fi
+          PROFILE="$(yq '.profile // "default"' "$CONFIG")"
+          ORG="$(yq ".profiles.\"${PROFILE}\".organization // \"\"" "$CONFIG")"
+          if [[ -z "$ORG" || "$ORG" == "null" ]]; then
+            echo "Unable to determine Unikraft organization name from $CONFIG" >&2
+            exit 1
+          fi
+          echo "Using organization: ${ORG}"
+
+          IMAGE="${ORG}/${NAME}:latest"      # 注意：name 须是合法镜像名（小写字母/数字/-）
+
+          # ---------- 3. 生成构建目录：Dockerfile + Kraftfile ----------
+          CTX="$(mktemp -d)"
+
+          if [[ -n "$DOCKERFILE" ]]; then
+            # 写了 build.dockerfile：原样使用（适合需要下载二进制、装依赖的项目）
+            printf '%s\n' "$DOCKERFILE" > "$CTX/Dockerfile"
+          else
+            # 只写了 build.base_image：生成一行 FROM（适合直接包装现成镜像）
+            printf 'FROM %s\n' "$BASE_IMAGE" > "$CTX/Dockerfile"
+          fi
+
+          {
+            echo "spec: v0.7"
+            echo "runtime: ${RUNTIME}"
+            echo "rootfs: ./Dockerfile"
+            # build.cmd 不为空时，写入 Kraftfile 的 cmd（覆盖启动命令）
+            if [[ "$(yq '(.build.cmd // []) | length' "$CFG")" -gt 0 ]]; then
+              yq '{"cmd": .build.cmd}' "$CFG"
+            fi
+          } > "$CTX/Kraftfile"
+
+          echo "---- Dockerfile ----"; cat "$CTX/Dockerfile"
+          echo "---- Kraftfile ----";  cat "$CTX/Kraftfile"
+
+          # ---------- 4. 构建并推送（每次部署都会重新构建）----------
+          unikraft build "$CTX" --output "$IMAGE"
+
+          # ---------- 5. 组装 unikraft run 命令 ----------
+          # 实例名固定为 <name>-<metro>；同名实例已存在时会失败（需先用 delete 工作流删除）
+          INSTANCE="${NAME}-${METRO_CODE}"
+
+          CMD=(unikraft run
+            --metro "$METRO_CODE"
+            --name "$INSTANCE"
+            -m "$MEMORY"
+            --image "$IMAGE"
+            -o json)
+
+          if [[ -n "$VCPUS" ]]; then
+            CMD+=(--vcpus "$VCPUS")
+          fi
+
+          # scale_to_zero 为空 = 不传该参数 = 平台默认不休眠（常驻运行）
+          if [[ -n "$SCALE_TO_ZERO" ]]; then
+            CMD+=(--scale-to-zero "$SCALE_TO_ZERO")
+          fi
+
+          # ports 列表 → 多个 --publish（如 443:3001/http+tls）
+          while IFS= read -r item; do
+            if [[ -n "$item" ]]; then CMD+=(--publish "$item"); fi
+          done < <(yq '(.ports // [])[]' "$CFG")
+
+          # env 列表 → 多个 --env（如 KEY=VALUE）
+          while IFS= read -r item; do
+            if [[ -n "$item" ]]; then CMD+=(--env "$item"); fi
+          done < <(yq '(.env // [])[]' "$CFG")
+
+          # volumes 列表：先创建卷（已存在则忽略报错），再挂载
+          VOL_COUNT="$(yq '(.volumes // []) | length' "$CFG")"
+          for ((i = 0; i < VOL_COUNT; i++)); do
+            VNAME="$(yq ".volumes[$i].name" "$CFG")"
+            VPATH="$(yq ".volumes[$i].path" "$CFG")"
+            VSIZE="$(yq ".volumes[$i].size // \"1G\"" "$CFG")"
+            echo "Ensuring volume ${VNAME} (${VSIZE}) in ${METRO_CODE}"
+            unikraft volume create --metro "$METRO_CODE" --name "$VNAME" --size "$VSIZE" \
+              || echo "Volume ${VNAME}: create failed or already exists, continuing." >&2
+            CMD+=(--volume "${VNAME}:${VPATH}")
+          done
+
+          # ---------- 6. 运行，并提取 FQDN（与原项目一致）----------
+          echo "Running: ${CMD[*]}"
+          RUN_JSON="$("${CMD[@]}")"
+          echo "$RUN_JSON" > run-output.json
+
+          FQDN="$(jq -r '[.. | objects | .fqdn? | select(type == "string")] | first // empty' run-output.json)"
+          if [[ -z "$FQDN" || "$FQDN" == "null" ]]; then
+            echo "Failed to resolve instance FQDN from deploy output." >&2
+            cat run-output.json >&2
+            exit 1
+          fi
+
+          {
+            echo "fqdn=${FQDN}"
+            echo "metro=${METRO_CODE}"
+            echo "instance=${INSTANCE}"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Deployed at: https://${FQDN}"
+
+      # ---- 在 Actions 的 Summary 页面显示部署结果 ----
+      - name: Summary
+        env:
+          PROJECT: ${{ inputs.project }}
+          FQDN: ${{ steps.deploy.outputs.fqdn }}
+          METRO_CODE: ${{ steps.deploy.outputs.metro }}
+          INSTANCE: ${{ steps.deploy.outputs.instance }}
+          IMAGE: ${{ steps.deploy.outputs.image }}
+        run: |
+          {
+            echo "### 部署完成"
+            echo ""
+            echo "- **项目**: \`${PROJECT}\`"
+            echo "- **地区**: \`${METRO_CODE}\`"
+            echo "- **实例名**: \`${INSTANCE}\`（删除时使用）"
+            echo "- **镜像**: \`${IMAGE}\`"
+            echo "- **访问地址**: https://${FQDN}"
+          } >> "$GITHUB_STEP_SUMMARY"
