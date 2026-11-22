@@ -12,8 +12,13 @@ build:
   # ▶ 基础镜像：换项目时改成目标镜像，如 louislam/uptime-kuma:2、nginx:1.27
   base_image: louislam/uptime-kuma:2
 
-  # ▶（可选）启动命令。默认沿用镜像自带命令；若实例起不来，看日志后在此显式指定
-  # cmd: ["node", "server/server.js"]
+  # ▶ 启动命令。
+  #   原镜像的启动命令是相对路径 `node server/server.js`，而构建出的 unikernel 不会保留
+  #   原镜像的工作目录（WORKDIR /app），进程会在 / 下运行，于是报
+  #   "Cannot find module '/server/server.js'"。
+  #   Uptime Kuma 的前端文件（dist）和数据目录（data）也都是相对当前目录的，
+  #   所以必须先 cd /app，再启动。换项目时按该项目的原始 WORKDIR/CMD 改写。
+  cmd: ["/bin/sh", "-c", "cd /app && exec node server/server.js"]
 
   # ▶（可选）完整 Dockerfile。写了它会忽略上面的 base_image。
   #   适合需要下载二进制、安装依赖的项目（如 Alist）。不支持 COPY 仓库里的本地文件。
@@ -37,6 +42,7 @@ ports:
 # ▶ 环境变量，每行一个 KEY=VALUE。注意：这里的内容会出现在 Actions 日志里，别写密码。
 env:
   - UPTIME_KUMA_PORT=3001
+  - NODE_ENV=production
 
 # ▶ 持久化目录。path 必须是该程序存放数据的目录（Uptime Kuma 为 /app/data）。
 #   卷按地区独立；删除实例不会删除卷。不需要持久化就整段删掉。
