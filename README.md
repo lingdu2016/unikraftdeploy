@@ -1,6 +1,6 @@
 # unikraft-deploy（通用版）
 
-在 [Unikraft Cloud](https://unikraft.cloud) 上一键部署任意镜像。每次部署都会「构建 → 推送到你的组织 → 运行」。一个统一工作流 + 根目录 `<project>.yaml` 配置，新增项目只需加一个 yaml。
+在 [Unikraft Cloud](https://unikraft.cloud) 上一键部署任意镜像：「(按需)构建 → 推送到你的组织 → 运行 → 校验实例已 running」。一个统一工作流 + 根目录 `<project>.yaml` 配置，新增项目只需加一个 yaml。
 
 ```
 .
@@ -25,7 +25,10 @@
 
 1. **Actions → Deploy Unikraft Instance → Run workflow**
 2. 选择 `project`（对应根目录 yaml）和 `metro`（地区）
-3. 完成后在 **Job Summary** 查看访问地址（FQDN）与实例名
+3. `rebuild`：默认不勾选。组织里已有同名镜像（`<组织>/<name>`）时会**跳过构建**直接运行；修改了 yaml 里的 `build` 部分，或怀疑旧镜像有问题时，请勾选 `rebuild` 强制重新构建
+4. 完成后在 **Job Summary** 查看访问地址（FQDN）与实例名
+
+部署最后会轮询实例状态，最长约 200 秒：进入 `running`（或按策略缩容的 `standby`）才算成功；实例被平台停止则工作流失败，并在日志里打印 `instances get` 与 `instances logs` 的输出。若停止原因是 `image pull failed`（刚推送的镜像首次启动时可能出现），会自动重新启动实例，最多重试 3 次；应用自身崩溃等其他原因不会重试。
 
 实例名固定为 `<name>-<metro>`（如 `uptime-kuma-sin`）。同名实例已存在时会部署失败，这是有意的保护：有持久化卷的应用不应在同一个卷上跑两个实例。需要重新部署时先删除旧实例。
 
@@ -54,6 +57,7 @@
 ## 新增一个项目
 
 1. 复制 `_template.yaml`（或 `uptime-kuma.yaml`）为 `myapp.yaml`，修改 `name`、`build.base_image`、`ports`、`volumes` 等标有 ▶ 的位置
+   - **先看目标镜像的 Dockerfile**，记下 `WORKDIR`、`ENTRYPOINT`、`CMD`、`ENV`、`EXPOSE`、`VOLUME`。构建出的 unikernel 不保证保留工作目录等设置，用 `base_image` 包装现成镜像时，需要在 `build.cmd` 里写完整启动命令并先 `cd` 到原工作目录（Uptime Kuma 就因此报过 `Cannot find module`）
 2. 在 `deploy.yml` 的 `project` 选项里追加一行 `- myapp`（GitHub 的下拉选项必须写死在工作流里，无法动态读取）
 
 ## 关于休眠
@@ -64,5 +68,5 @@ Unikraft 的 scale-to-zero 默认关闭：不传 `--scale-to-zero` 就不会因�
 
 - `UNIKRAFT_TOKEN` 只放在 GitHub Secrets，不要写入代码。
 - yaml 中的 `env` 会出现在 Actions 日志里，**不要在 yaml 中写密码、Token 等敏感值**。
-- `unikraft run --image` 使用的是 Unikraft 自己的镜像仓库，并不能直接拉取 Docker Hub 镜像，所以每次部署都会先构建并推送到你的组织。
+- `unikraft run --image` 使用的是 Unikraft 自己的镜像仓库，并不能直接拉取 Docker Hub 镜像，所以镜像必须先构建并推送到你的组织；组织里已有同名镜像时会复用。
 - 构建模式下，实例若启动失败，先看构建日志里打印出的 Dockerfile / Kraftfile，再用 `build.cmd` 显式指定启动命令。

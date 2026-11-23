@@ -1,14 +1,30 @@
 # =====================================================================
 # 新项目模板：复制为 <项目名>.yaml，然后在 deploy.yml 的 project 选项里追加 <项目名>
 # 凡是标 ▶ 的都是每个项目需要确认/修改的地方。
+#
+# ▶ 动手前，先看目标镜像的 Dockerfile（Docker Hub 页面或其 GitHub 仓库），记下：
+#     WORKDIR / ENTRYPOINT / CMD / ENV / EXPOSE（监听端口）/ VOLUME（数据目录）
+#   原因：构建出的 unikernel 以镜像的文件系统为基础，不保证保留 WORKDIR、
+#   ENTRYPOINT、ENV。Uptime Kuma 实测：启动命令沿用了，但工作目录丢失，
+#   进程在 / 下运行，报 Cannot find module '/server/server.js'。
+#   所以用 base_image 包装现成镜像时，下面的 build.cmd 基本都要写。
 # =====================================================================
 
 name: myapp                    # ▶ 实例名前缀 + 镜像名（小写字母/数字/-）
 
 build:
   base_image: owner/image:tag  # ▶ 目标镜像（与 dockerfile 二选一）
-  # cmd: ["/path/to/bin", "--arg"]   # ▶ 可选：启动命令
-  # dockerfile: |                    # ▶ 可选：完整 Dockerfile
+
+  # ▶ 启动命令（用 base_image 时基本必填）：
+  #   把原镜像的 ENTRYPOINT + CMD 合并成一条完整命令，并先 cd 到原 WORKDIR。
+  #   例（Uptime Kuma：WORKDIR /app，CMD node server/server.js）：
+  #     ["/bin/sh", "-c", "cd /app && exec node server/server.js"]
+  #   注意：这种写法要求镜像里有 /bin/sh；没有 sh 的极简镜像，
+  #   请改用二进制的绝对路径，如 ["/app/bin/server", "--port", "8080"]
+  cmd: ["/bin/sh", "-c", "cd /原WORKDIR && exec 原启动命令"]
+
+  # ▶ 需要下载二进制、安装依赖时，改用完整 Dockerfile（写了它会忽略 base_image）：
+  # dockerfile: |
   #   FROM debian:bookworm-slim
   #   ...
 
@@ -16,14 +32,14 @@ memory: 512M                   # ▶ 按需调整
 vcpus: 1
 
 ports:
-  - 443:8080/http+tls          # ▶ 8080 改成程序实际监听端口
+  - 443:8080/http+tls          # ▶ 8080 改成程序实际监听的端口（原镜像的 EXPOSE）
 
-env:                           # ▶ 可选，勿放密码
+env:                           # ▶ 原镜像 Dockerfile 里的 ENV 不保证保留，需要的在此重写；勿放密码
   - KEY=VALUE
 
-volumes:                       # ▶ 可选：需要持久化时填写
+volumes:                       # ▶ 需要持久化时填写
   - name: myapp-data
-    path: /data                # ▶ 程序存放数据的目录
+    path: /data                # ▶ 程序实际写数据的目录（原镜像的 VOLUME / 文档里的数据目录）
     size: 1G
 
 scale_to_zero: ""              # ▶ 留空=常驻；否则如 policy=idle,cooldown-time=1000,stateful=true
