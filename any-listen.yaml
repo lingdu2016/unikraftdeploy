@@ -1,0 +1,52 @@
+# =====================================================================
+# any-listen（私有音乐播放服务 · Web 版）
+# 运行工作流时 project 填：any-listen
+#
+# 依据（均来自官方资料）：
+#   - 镜像：Docker Hub  lyswhut/any-listen-web-server（docs/docker-server.md）
+#   - 仓库 Dockerfile： WORKDIR /server，CMD ["node","index.cjs"]，EXPOSE 9500，
+#       ENV PORT=9500 BIND_IP=0.0.0.0 DATA_PATH=/server/data NODE_ENV=production，
+#       基于 Alpine，镜像内以非 root 用户 anylisten 运行，且没有声明 VOLUME
+# 因此下面所有字段都是显式写死的（不依赖自动推导），尤其是 volumes：
+# 镜像没有声明 VOLUME，自动推导不会创建数据卷，数据会丢。
+# =====================================================================
+
+# ⚠ 官方文档只给出了仓库名，没有列出标签；latest 是否存在需实测，
+#   能确认版本号后建议改成固定版本，避免标签更新后行为变化。
+image: lyswhut/any-listen-web-server:latest
+
+# 实例名 = any-listen-<地区>，镜像 = <你的组织>/any-listen:latest
+name: any-listen
+
+# 启动命令 = 原 WORKDIR + CMD：cd /server && node index.cjs
+# （构建出的 unikernel 不保留 WORKDIR，必须先 cd；用 exec 让 node 成为主进程）
+cmd: ["/bin/sh", "-c", "cd /server && exec node index.cjs"]
+
+# 对外 443（平台终结 TLS）→ 程序监听 9500
+ports:
+  - 443:9500/http+tls
+
+env:
+  - PORT=9500
+  - BIND_IP=0.0.0.0            # 必须是 0.0.0.0，默认 127.0.0.1 外部访问不到
+  - DATA_PATH=/server/data     # 数据目录，与下面 volumes.path 保持一致
+  - NODE_ENV=production
+  # ⚠ 登录密码：请改成你自己的强密码。
+  #   注意：env 会出现在 Actions 日志里，且本文件会提交到仓库；
+  #   仓库务必设为私有，或部署后在应用里改密码（若支持）。
+  - LOGIN_PWD=change-me-please
+  # - TZ=Asia/Shanghai         # 需要北京时间时取消注释（镜像已装 tzdata）
+  # - ALLOW_PUBLIC_DIR=/music  # 允许访问的本地音乐目录；云端实例无本地音乐，建议改用 WebDAV 音乐源
+
+# 持久化：配置、播放列表、日志、扩展都在 DATA_PATH 下
+volumes:
+  - name: any-listen-data
+    path: /server/data
+    size: 1G
+
+memory: 512M
+vcpus: 1
+
+# 留空 = 常驻。音乐服务按需休眠会导致首次访问变慢；需要时再填，
+# 例如 policy=idle,cooldown-time=1000,stateful=true
+scale_to_zero: ""
