@@ -25,6 +25,7 @@ on:
         default: uptime-kuma
         options:
           - uptime-kuma
+          - any-listen
           # ▶ 新增项目时在这里追加，例如：
           # - alist
           # - nginx-proxy-manager
