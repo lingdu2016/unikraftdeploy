@@ -34,7 +34,7 @@ env:
   # ⚠ 登录密码：请改成你自己的强密码。
   #   注意：env 会出现在 Actions 日志里，且本文件会提交到仓库；
   #   仓库务必设为私有，或部署后在应用里改密码（若支持）。
-  - LOGIN_PWD=change-me-please
+  - LOGIN_PWD=aaa
   # - TZ=Asia/Shanghai         # 需要北京时间时取消注释（镜像已装 tzdata）
   # - ALLOW_PUBLIC_DIR=/music  # 允许访问的本地音乐目录；云端实例无本地音乐，建议改用 WebDAV 音乐源
 
@@ -42,11 +42,11 @@ env:
 volumes:
   - name: any-listen-data
     path: /server/data
-    size: 1G
+    size: 128M
 
-memory: 512M
+memory: 256M
 vcpus: 1
 
 # 留空 = 常驻。音乐服务按需休眠会导致首次访问变慢；需要时再填，
 # 例如 policy=idle,cooldown-time=1000,stateful=true
-scale_to_zero: ""
+scale_to_zero: "policy=idle,cooldown-time=500,stateful=true"
