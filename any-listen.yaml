@@ -1,6 +1,6 @@
 # =====================================================================
-# any-listen（私有音乐播放服务 · Web 版）
-# 运行工作流时 project 填：any-listen
+# any-listen（私有音乐播放服务 · Web 版）—— 原格式（build.base_image / build.cmd）
+# 运行工作流时 project 填：any-listen（旧版 deploy.yml 的下拉里需有 any-listen 这一项）
 #
 # 依据（均来自官方资料）：
 #   - 镜像：Docker Hub  lyswhut/any-listen-web-server（docs/docker-server.md）
@@ -11,16 +11,20 @@
 # 镜像没有声明 VOLUME，自动推导不会创建数据卷，数据会丢。
 # =====================================================================
 
-# ⚠ 官方文档只给出了仓库名，没有列出标签；latest 是否存在需实测，
-#   能确认版本号后建议改成固定版本，避免标签更新后行为变化。
-image: lyswhut/any-listen-web-server:latest
-
 # 实例名 = any-listen-<地区>，镜像 = <你的组织>/any-listen:latest
 name: any-listen
 
-# 启动命令 = 原 WORKDIR + CMD：cd /server && node index.cjs
-# （构建出的 unikernel 不保留 WORKDIR，必须先 cd；用 exec 让 node 成为主进程）
-cmd: ["/bin/sh", "-c", "cd /server && exec node index.cjs"]
+build:
+  # ⚠ 官方文档只给出了仓库名，没有列出标签；latest 是否存在需实测，
+  #   能确认版本号后建议改成固定版本，避免标签更新后行为变化。
+  base_image: lyswhut/any-listen-web-server:latest
+
+  # 启动命令 = 原 WORKDIR + CMD：cd /server && node index.cjs
+  # （构建出的 unikernel 不保留 WORKDIR，必须先 cd；用 exec 让 node 成为主进程）
+  cmd: ["/bin/sh", "-c", "cd /server && exec node index.cjs"]
+
+memory: 256M
+vcpus: 1
 
 # 对外 443（平台终结 TLS）→ 程序监听 9500
 ports:
@@ -42,11 +46,11 @@ env:
 volumes:
   - name: any-listen-data
     path: /server/data
-    size: 128M
+    size: 256M
 
-memory: 256M
-vcpus: 1
-
-# 留空 = 常驻。音乐服务按需休眠会导致首次访问变慢；需要时再填，
-# 例如 policy=idle,cooldown-time=1000,stateful=true
-scale_to_zero: "policy=idle,cooldown-time=500,stateful=true"
+# 休眠策略（scale-to-zero）：
+#   policy=idle        空闲时休眠：无活动 HTTP 请求，且已建立的连接在冷却时间内无数据
+#   cooldown-time=...  冷却时间，单位毫秒（官方示例 1000 显示为 1s），300000 = 5 分钟
+#   stateful=true      休眠时保存内存快照，唤醒后接着运行（毫秒级）
+# 留空 = 常驻不休眠。音乐服务休眠后首次访问会有唤醒延迟。
+scale_to_zero: "policy=idle,cooldown-time=300000,stateful=true"
